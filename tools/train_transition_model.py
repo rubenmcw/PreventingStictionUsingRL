@@ -30,8 +30,17 @@ def load_npz(path: str) -> Tuple[np.ndarray, np.ndarray, dict]:
     data = np.load(path, allow_pickle=True)
     X = data["X"].astype(float)
     y = data["y"].astype(float)
-    meta = data.get("meta", {})
-    return X, y, meta
+    meta_raw = data["meta"] if "meta" in data.files else {}
+    # meta may be stored as a 0-d array, a length-1 object array, or already a dict
+    if isinstance(meta_raw, np.ndarray):
+        try:
+            if meta_raw.shape == () or meta_raw.size == 1:
+                meta_raw = meta_raw.item()
+        except Exception:
+            pass
+    if not isinstance(meta_raw, dict):
+        meta_raw = {}
+    return X, y, meta_raw
 
 
 def make_targets(y: np.ndarray) -> np.ndarray:
