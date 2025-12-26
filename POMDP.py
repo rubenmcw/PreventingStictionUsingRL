@@ -701,10 +701,18 @@ def _softmax_rows_with_floor(logits: np.ndarray, uniform_floor: float = LEARNED_
     return probs
 
 def _transition_features(u: float, dtheta: float, theta: float,
-                         history: Optional[Iterable[Tuple[float, float, float]]] = None) -> np.ndarray:
+                         history: Optional[Iterable[Tuple[float, float, float]]] = None,
+                         history_len: Optional[int] = LEARNED_TRANS_HISTORY) -> np.ndarray:
     base = [u, dtheta, theta, abs(u), abs(dtheta), 1.0]
-    if history:
-        base.extend(np.array(list(history), float).ravel().tolist())
+    hist_list = list(history) if history is not None else []
+    if history_len is None:
+        history_len = len(hist_list)
+    # keep the most recent entries and pad to fixed length
+    hist_list = hist_list[-history_len:]
+    if len(hist_list) < history_len:
+        hist_list = [ (0.0, 0.0, 0.0) ] * (history_len - len(hist_list)) + hist_list
+    if hist_list:
+        base.extend(np.array(hist_list, float).ravel().tolist())
     return np.array(base, float)
 
 def transition_matrix(a: float, dtheta: float, theta: float,
@@ -745,7 +753,8 @@ def learned_transition(u: float, dtheta: float, theta: float,
     vector → logits, or simple weight dictionaries/arrays. Returns a (5×5)
     matrix with row-softmax and a small uniform floor.
     """
-    feats = _transition_features(u, dtheta, theta, history)
+    hist_len = getattr(history, "maxlen", LEARNED_TRANS_HISTORY)
+    feats = _transition_features(u, dtheta, theta, history, history_len=hist_len)
     logits = None
 
     # (1) Callable model
