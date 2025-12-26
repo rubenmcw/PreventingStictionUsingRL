@@ -1202,6 +1202,7 @@ class GraspSM:
 
         angle = float(self.data.qpos[self.hinge.qadr]) if self.hinge.enabled else 0.0
         setpoint = float(self.hinge.sp) if self.hinge.enabled else 0.0
+        dq      = float(self.data.qvel[self.hinge.vadr]) if self.hinge.enabled else 0.0
         tau_cmd  = float(self.hinge.last_tau_cmd) if self.hinge.enabled else 0.0
         tau_load = float(self.hload.last_tau) if self.hload.enabled else 0.0
 
@@ -1210,10 +1211,13 @@ class GraspSM:
         pos_err = self.v_contact.last_pos_err if self.v_contact.enabled else 0.0
         rot_err = self.v_contact.last_rot_err if self.v_contact.enabled else 0.0
         risk    = self.hinge.last_risk if self.hinge.enabled else 0.0
+        belief  = self.hinge.belief if self.hinge.enabled else np.ones(N_REG) / N_REG
 
         pkt = dict(t=t, angle=angle, setpoint=setpoint,
-                   tau_cmd=tau_cmd, tau_load=tau_load,
+                   dq=dq, tau_cmd=tau_cmd, tau_load=tau_load,
                    F=F, M=M, pos_err=pos_err, rot_err=rot_err, risk=risk)
+        for j in range(N_REG):
+            pkt[f"b{j}"] = float(belief[j])
         try:
             self.plot_q.put_nowait(pkt)
         except queue.Full:
@@ -1259,6 +1263,7 @@ class TelemetryRecorder:
                 "t": pkt["t"],
                 "angle": pkt["angle"],
                 "setpoint": pkt["setpoint"],
+                "dq": pkt["dq"],
                 "tau_cmd": pkt["tau_cmd"],
                 "tau_load": pkt["tau_load"],
                 "Fx": float(pkt["F"][0]),
@@ -1270,6 +1275,11 @@ class TelemetryRecorder:
                 "pos_err": pkt["pos_err"],
                 "rot_err": pkt["rot_err"],
                 "risk": pkt["risk"],
+                "b0": pkt.get("b0", 0.0),
+                "b1": pkt.get("b1", 0.0),
+                "b2": pkt.get("b2", 0.0),
+                "b3": pkt.get("b3", 0.0),
+                "b4": pkt.get("b4", 0.0),
             })
 
     def flush(self):
