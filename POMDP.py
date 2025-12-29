@@ -108,7 +108,7 @@ PLOT_QUEUE_SIZE     = 2000
 PLOT_WINDOW_SEC     = 30.0   # dynamic autoscale over whole trajectory anyway
 
 # --- optional telemetry persistence
-SAVE_CSV            = False
+SAVE_CSV            = True
 SAVE_NPZ            = False
 SAVE_DIR            = "telemetry_out"
 
