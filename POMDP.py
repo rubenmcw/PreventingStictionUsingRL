@@ -1468,7 +1468,9 @@ def simulation_thread(model, data, total_time_s, realtime, plotter_ui: LivePlott
     hinge_ctrl = HingePOMDP(model, data, joint_name=FREEZE_PANEL_JOINT,
                             dt=CTRL_DT, tau_sat=POMDP_TAU_SAT,
                             sp_speed=POMDP_SP_SPEED_RAD_S, params=POMDP_FRIC,
-                            J_est=J_eq, D_est=POMDP_D_EST)
+                            J_est=J_eq, D_est=POMDP_D_EST,
+                            use_learned_transition=True,
+                            transition_model_path=os.path.join("results", "transition_training", "transition_model.npz"))
     hinge_load = HingeLoad(model, data, joint_name=FREEZE_PANEL_JOINT,
                            amp_frac=LOAD_SINE_AMP_FRAC, freq_hz=LOAD_SINE_FREQ_HZ,
                            phase=LOAD_PHASE, tau_sat=POMDP_TAU_SAT)
