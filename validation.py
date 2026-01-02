@@ -402,8 +402,6 @@ class POMDPCtrl:
 
 # ------------------------------- Simulation ----------------------------------
 
-def deg(x): return x*180.0/math.pi
-
 def escape_time(t, angle, setpoint, goal):
     """Primary: within ESC_TOL_DEG for ESC_DWELL_S; Fallback: 4%% pairwise closeness & non-zero."""
     tol = math.radians(ESC_TOL_DEG)
