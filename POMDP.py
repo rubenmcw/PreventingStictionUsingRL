@@ -156,6 +156,10 @@ LOAD_SINE_FREQ_HZ   = 0.5
 LOAD_SINE_AMP_FRAC  = 0.35  # of POMDP_TAU_SAT
 LOAD_PHASE          = 0.0
 
+# Learned transition toggle (keep path handy but disabled while collecting new data)
+USE_LEARNED_TRANSITION = False
+TRANSITION_MODEL_PATH = os.path.join("results", "transition_training", "transition_model.npz")
+
 
 # =============================================================================
 # ------------------------------- UTILITIES -----------------------------------
@@ -1469,8 +1473,8 @@ def simulation_thread(model, data, total_time_s, realtime, plotter_ui: LivePlott
                             dt=CTRL_DT, tau_sat=POMDP_TAU_SAT,
                             sp_speed=POMDP_SP_SPEED_RAD_S, params=POMDP_FRIC,
                             J_est=J_eq, D_est=POMDP_D_EST,
-                            use_learned_transition=True,
-                            transition_model_path=os.path.join("results", "transition_training", "transition_model.npz"))
+                            use_learned_transition=USE_LEARNED_TRANSITION,
+                            transition_model_path=(TRANSITION_MODEL_PATH if USE_LEARNED_TRANSITION else None))
     hinge_load = HingeLoad(model, data, joint_name=FREEZE_PANEL_JOINT,
                            amp_frac=LOAD_SINE_AMP_FRAC, freq_hz=LOAD_SINE_FREQ_HZ,
                            phase=LOAD_PHASE, tau_sat=POMDP_TAU_SAT)
