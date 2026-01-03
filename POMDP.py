@@ -156,8 +156,8 @@ LOAD_SINE_FREQ_HZ   = 0.5
 LOAD_SINE_AMP_FRAC  = 0.35  # of POMDP_TAU_SAT
 LOAD_PHASE          = 0.0
 
-# Learned transition toggle (keep path handy but disabled while collecting new data)
-USE_LEARNED_TRANSITION = False
+# Learned transition toggle and default artifact location
+USE_LEARNED_TRANSITION = True
 TRANSITION_MODEL_PATH = os.path.join("results", "transition_training", "transition_model.npz")
 
 
