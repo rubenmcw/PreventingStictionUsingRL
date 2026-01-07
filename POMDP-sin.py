@@ -28,9 +28,10 @@ import time
 import math
 import threading
 import queue
+from collections import deque
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Iterable
 
 import numpy as np
 
@@ -105,6 +106,10 @@ PLOT_WINDOW_SEC     = 30.0   # dynamic autoscale over whole trajectory anyway
 # --- POMDP hinge config -------------------------------------------------------
 POMDP_TAU_SAT            = 5.0                 # torque cap (N·m)
 POMDP_SP_SPEED_RAD_S     = math.radians(12.0)  # setpoint slew
+TRANSITION_MODEL_PATH = os.path.join("results", "transition_training", "transition_model.npz")
+LEARNED_TRANS_HISTORY = 6
+LEARNED_TRANS_FLOOR = 1e-3
+USE_LEARNED_TRANSITION = False
 
 @dataclass
 class StribeckParameters:
@@ -691,6 +696,33 @@ def friction_torque(theta: float, dtheta: float, reg: int, p: StribeckParameters
 
 def sigmoid(x: float) -> float: return 1.0/(1.0+np.exp(-x))
 
+def _softmax_rows_with_floor(logits: np.ndarray, uniform_floor: float = LEARNED_TRANS_FLOOR) -> np.ndarray:
+    """Row-wise softmax with an added uniform mass to guarantee support."""
+    z = np.asarray(logits, float).reshape(N_REG, N_REG)
+    z = z - np.max(z, axis=1, keepdims=True)
+    exp_z = np.exp(z)
+    probs = exp_z / np.clip(exp_z.sum(axis=1, keepdims=True), 1e-12, None)
+
+    if uniform_floor > 0.0:
+        eps = min(float(uniform_floor), 1.0 / N_REG - 1e-6)
+        probs = (1.0 - eps * N_REG) * probs + eps
+        probs /= np.clip(probs.sum(axis=1, keepdims=True), 1e-12, None)
+    return probs
+
+def _transition_features(u: float, dtheta: float, theta: float,
+                         history: Optional[Iterable[Tuple[float, float, float]]] = None,
+                         history_len: Optional[int] = LEARNED_TRANS_HISTORY) -> np.ndarray:
+    base = [u, dtheta, theta, abs(u), abs(dtheta), 1.0]
+    hist_list = list(history) if history is not None else []
+    if history_len is None:
+        history_len = len(hist_list)
+    hist_list = hist_list[-history_len:]
+    if len(hist_list) < history_len:
+        hist_list = [ (0.0, 0.0, 0.0) ] * (history_len - len(hist_list)) + hist_list
+    if hist_list:
+        base.extend(np.array(hist_list, float).ravel().tolist())
+    return np.array(base, float)
+
 def transition_matrix(a: float, dtheta: float, theta: float,
                       p: StribeckParameters, eps_any: float = 0.02) -> np.ndarray:
     """Right‑stochastic regime transition model."""
@@ -719,6 +751,50 @@ def transition_matrix(a: float, dtheta: float, theta: float,
     T = (1.0 - eps_any) * T + eps_any * U
     T /= T.sum(axis=1, keepdims=True)
     return T
+
+def learned_transition(u: float, dtheta: float, theta: float,
+                       model,
+                       history: Optional[Iterable[Tuple[float, float, float]]] = None,
+                       uniform_floor: float = LEARNED_TRANS_FLOOR) -> np.ndarray:
+    """
+    Learned right-stochastic model. Accepts any callable that maps a feature
+    vector → logits, or simple weight dictionaries/arrays. Returns a (5×5)
+    matrix with row-softmax and a small uniform floor.
+    """
+    hist_len = getattr(history, "maxlen", LEARNED_TRANS_HISTORY)
+    feats = _transition_features(u, dtheta, theta, history, history_len=hist_len)
+    logits = None
+
+    # (1) Callable model
+    if callable(model):
+        logits = model(feats)
+    # (2) Npz wrapper
+    elif isinstance(model, np.lib.npyio.NpzFile):
+        if "model" in model.files and model["model"].shape == ():
+            maybe = model["model"].item()
+            if callable(maybe):
+                logits = maybe(feats)
+        if logits is None:
+            W = model["W"] if "W" in model.files else model["weights"] if "weights" in model.files else None
+            b = model["b"] if "b" in model.files else model["bias"] if "bias" in model.files else 0.0
+            if W is not None:
+                logits = np.tensordot(feats, W, axes=1) + b
+        if logits is None and "logits" in model.files:
+            logits = model["logits"]
+    # (3) Dict of weights/bias
+    elif isinstance(model, dict):
+        W = model.get("W", model.get("weights", None))
+        b = model.get("b", model.get("bias", 0.0))
+        if W is not None:
+            logits = np.tensordot(feats, W, axes=1) + b
+        elif "logits" in model:
+            logits = model["logits"]
+    # (4) Raw array already containing logits
+    if logits is None:
+        logits = model
+
+    logits = np.asarray(logits, float).reshape(N_REG, N_REG)
+    return _softmax_rows_with_floor(logits, uniform_floor=uniform_floor)
 
 
 def pomdp_only_ctrl(action_levels: np.ndarray,
@@ -820,7 +896,11 @@ class HingePOMDP:
                  sp_speed=POMDP_SP_SPEED_RAD_S,
                  params=POMDP_FRIC,
                  J_est=POMDP_J_EST,
-                 D_est=POMDP_D_EST):
+                 D_est=POMDP_D_EST,
+                 use_learned_transition: bool = USE_LEARNED_TRANSITION,
+                 transition_model_path: Optional[str] = None,
+                 learned_transition_floor: float = LEARNED_TRANS_FLOOR,
+                 transition_history_len: int = LEARNED_TRANS_HISTORY):
         self.model = model; self.data = data
         self.jid  = id_or_fail(model, mjtObj.mjOBJ_JOINT, joint_name)
         self.qadr = model.jnt_qposadr[self.jid]
@@ -864,6 +944,16 @@ class HingePOMDP:
         self.Ki_bias = 0.6               # N·m per rad·s
         self.bias_limit = 0.35*self.tau_sat
 
+        # Learned transition (optional)
+        self.use_learned_transition = bool(use_learned_transition)
+        self.transition_model = None
+        self.transition_history = deque(maxlen=int(transition_history_len))
+        self._transition_uniform_floor = float(learned_transition_floor)
+        if transition_model_path is not None:
+            self.transition_model = self._load_transition_model(transition_model_path)
+            if self.transition_model is not None:
+                self.use_learned_transition = True
+
     def enable_and_capture(self):
         q = float(self.data.qpos[self.qadr])
         self.sp = self.sp_goal = q
@@ -873,6 +963,7 @@ class HingePOMDP:
         self.belief[:] = 1.0/N_REG
         self.k = 0
         self.enabled = True
+        self.transition_history.clear()
         print(f"[hinge-POMDP] Enabled at q={q:.4f} rad; tau_sat={self.tau_sat:.1f} N·m; J_est={self.J_est:.4f}")
 
     def set_target_relative(self, dq: float):
@@ -887,6 +978,31 @@ class HingePOMDP:
         if self.model.jnt_limited[self.jid] == 1: lo, hi = self.model.jnt_range[self.jid]
         self.sp_goal = clamp(float(q_abs), lo, hi)
         print(f"[hinge-POMDP] Target ABS → goal={self.sp_goal:.4f} rad")
+
+    def _load_transition_model(self, path: str):
+        try:
+            obj = np.load(path, allow_pickle=True)
+            print(f"[hinge-POMDP] Learned transition model loaded from '{path}'.")
+            return obj
+        except Exception as exc:
+            print(f"[hinge-POMDP] Failed to load learned transition model '{path}': {exc}")
+            return None
+
+    def _compute_transition(self, u: float, dq: float, q: float) -> np.ndarray:
+        if self.use_learned_transition and self.transition_model is not None:
+            try:
+                T = learned_transition(
+                    u, dq, q,
+                    model=self.transition_model,
+                    history=self.transition_history,
+                    uniform_floor=self._transition_uniform_floor
+                )
+                if T.shape != (N_REG, N_REG) or not np.all(np.isfinite(T)):
+                    raise ValueError("invalid learned transition output")
+                return T
+            except Exception as exc:
+                print(f"[hinge-POMDP] Learned transition failed ({exc}); falling back to heuristic.")
+        return transition_matrix(u, dq, q, self.params)
 
     def step(self):
         if not self.enabled: return
@@ -936,7 +1052,7 @@ class HingePOMDP:
         L = np.exp(-0.5 * (e / SIGMA_RESIDUAL)**2)
         L = np.clip(L, 1e-12, None)
 
-        T = transition_matrix(u, dq, q, self.params)
+        T = self._compute_transition(u, dq, q)
         b_pred = self.belief @ T
         b_post = b_pred * L
         b_post = np.clip(b_post, BELIEF_FLOOR, None)
@@ -947,6 +1063,9 @@ class HingePOMDP:
         self.last_risk_act = float(1.0 if abs(u) > TAU_MAX_FOR_RISK else 0.0)
         self.last_risk_err = float(1.0 if abs(q - self.sp) > ERROR_RISK_THRESH_RAD else 0.0)
         self.last_risk     = max(self.last_risk_act, self.last_risk_err)
+
+        # keep short history for learned transition features
+        self.transition_history.append((u, dq, q))
 
         self.k += 1
 
@@ -1440,7 +1559,9 @@ def simulation_thread(model, data, total_time_s, realtime, plotter_ui: LivePlott
     hinge_ctrl = HingePOMDP(model, data, joint_name=FREEZE_PANEL_JOINT,
                             dt=CTRL_DT, tau_sat=POMDP_TAU_SAT,
                             sp_speed=POMDP_SP_SPEED_RAD_S, params=POMDP_FRIC,
-                            J_est=J_eq, D_est=POMDP_D_EST)
+                            J_est=J_eq, D_est=POMDP_D_EST,
+                            use_learned_transition=USE_LEARNED_TRANSITION,
+                            transition_model_path=(TRANSITION_MODEL_PATH if USE_LEARNED_TRANSITION else None))
     hinge_load = HingeLoad(model, data, joint_name=FREEZE_PANEL_JOINT,
                            amp_frac=LOAD_SINE_AMP_FRAC, freq_hz=LOAD_SINE_FREQ_HZ,
                            phase=LOAD_PHASE, tau_sat=POMDP_TAU_SAT)
