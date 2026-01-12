@@ -983,7 +983,8 @@ class HingePOMDP:
                 H[0, i] = (tau_plus - tau_minus) / (2.0 * delta)
 
             S = H @ self.param_P @ H.T + SIGMA_RESIDUAL**2
-            K = (self.param_P @ H.T) / float(S)
+            S_scalar = float(S.squeeze())
+            K = (self.param_P @ H.T) / S_scalar
             self.param_x = self.param_x + (K.flatten() * resid)
             self.param_P = (np.eye(self.param_x.size) - K @ H) @ self.param_P
             self.param_x = clamp_params(self.param_x, self.param_bounds)
