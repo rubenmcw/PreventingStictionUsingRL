@@ -113,7 +113,7 @@ POMDP_SP_SPEED_RAD_S     = math.radians(12.0)  # setpoint slew
 TRANSITION_MODEL_PATH = os.path.join("results", "transition_training", "transition_model.npz")
 LEARNED_TRANS_HISTORY = 6
 LEARNED_TRANS_FLOOR = 1e-3
-USE_LEARNED_TRANSITION = False
+USE_LEARNED_TRANSITION = True
 
 @dataclass
 class StribeckParameters:
@@ -757,6 +757,31 @@ def transition_matrix(a: float, dtheta: float, theta: float,
     T /= T.sum(axis=1, keepdims=True)
     return T
 
+def _mlp_logits(feats: np.ndarray, weights, biases) -> np.ndarray:
+    x = feats
+    for idx, (W, b) in enumerate(zip(weights, biases)):
+        x = np.tensordot(x, W, axes=1) + b
+        if idx < len(weights) - 1:
+            x = np.maximum(0.0, x)
+    return x
+
+
+def _load_mlp_weights(keys, getter):
+    weight_keys = sorted(
+        [k for k in keys if k.startswith("W") and k[1:].isdigit()],
+        key=lambda k: int(k[1:])
+    )
+    if not weight_keys:
+        return None
+    weights = []
+    biases = []
+    for key in weight_keys:
+        idx = key[1:]
+        weights.append(getter(key))
+        b_key = f"b{idx}"
+        biases.append(getter(b_key) if b_key in keys else 0.0)
+    return weights, biases
+
 def learned_transition(u: float, dtheta: float, theta: float,
                        model,
                        history: Optional[Iterable[Tuple[float, float, float]]] = None,
@@ -780,6 +805,10 @@ def learned_transition(u: float, dtheta: float, theta: float,
             if callable(maybe):
                 logits = maybe(feats)
         if logits is None:
+            weights_biases = _load_mlp_weights(model.files, model.__getitem__)
+            if weights_biases is not None:
+                logits = _mlp_logits(feats, *weights_biases)
+        if logits is None:
             W = model["W"] if "W" in model.files else model["weights"] if "weights" in model.files else None
             b = model["b"] if "b" in model.files else model["bias"] if "bias" in model.files else 0.0
             if W is not None:
@@ -788,12 +817,16 @@ def learned_transition(u: float, dtheta: float, theta: float,
             logits = model["logits"]
     # (3) Dict of weights/bias
     elif isinstance(model, dict):
-        W = model.get("W", model.get("weights", None))
-        b = model.get("b", model.get("bias", 0.0))
-        if W is not None:
-            logits = np.tensordot(feats, W, axes=1) + b
-        elif "logits" in model:
-            logits = model["logits"]
+        weights_biases = _load_mlp_weights(model.keys(), model.get)
+        if weights_biases is not None:
+            logits = _mlp_logits(feats, *weights_biases)
+        else:
+            W = model.get("W", model.get("weights", None))
+            b = model.get("b", model.get("bias", 0.0))
+            if W is not None:
+                logits = np.tensordot(feats, W, axes=1) + b
+            elif "logits" in model:
+                logits = model["logits"]
     # (4) Raw array already containing logits
     if logits is None:
         logits = model
