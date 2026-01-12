@@ -113,7 +113,7 @@ POMDP_SP_SPEED_RAD_S     = math.radians(12.0)  # setpoint slew
 TRANSITION_MODEL_PATH = os.path.join("results", "transition_training", "transition_model.npz")
 LEARNED_TRANS_HISTORY = 6
 LEARNED_TRANS_FLOOR = 1e-3
-USE_LEARNED_TRANSITION = True
+USE_LEARNED_TRANSITION = False
 
 @dataclass
 class StribeckParameters:
