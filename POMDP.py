@@ -41,6 +41,7 @@ import numpy as np
 import mujoco as mj
 from mujoco import mjtObj
 
+from pomdp_optimizer import DeltaUOptimizerConfig, DeltaUSequenceOptimizer
 
 # =============================================================================
 # ------------------------------- CONFIG --------------------------------------
@@ -155,6 +156,12 @@ POMDP_W_RISK       = 1.5
 # (5) Δu penalty replaces output low‑pass smoothing
 POMDP_W_DU         = 2e-4
 POMDP_U_SMOOTH_ALPHA = 0.0  # keep path but disabled
+# Explicit saturation penalties
+POMDP_W_SAT        = 20.0
+POMDP_W_RAIL       = 5.0
+POMDP_SAT_ALPHA    = 0.8
+POMDP_RAIL_BETA    = 0.95
+POMDP_DU_MAX       = 0.10 * POMDP_TAU_SAT
 
 # Short horizon look‑ahead for POMDP action evaluation (keeps runtime light)
 POMDP_H_CTRL       = 12
@@ -736,7 +743,12 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
                     w_vel: float,
                     w_u: float,
                     w_risk: float,
-                    w_du: float):
+                    w_du: float,
+                    w_sat: float,
+                    w_rail: float,
+                    sat_alpha: float,
+                    rail_beta: float,
+                    du_max: float):
     """
     Discrete action selection with a short horizon rollout; includes Δu
     regularization (w_du) applied at the first stage cost.
@@ -747,6 +759,21 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
     gamma = float(POMDP_GAMMA)
     tau_sat = float(np.max(np.abs(action_levels)))
     rng = np.random.default_rng()
+    optimizer = DeltaUSequenceOptimizer(
+        DeltaUOptimizerConfig(
+            horizon=H,
+            tau_sat=tau_sat,
+            du_max=float(du_max),
+            cem_samples=int(POMDP_CEM_SAMPLES),
+            cem_elites=int(POMDP_CEM_ELITES),
+            cem_iters=int(POMDP_CEM_ITERS),
+            cem_init_std=float(POMDP_CEM_INIT_STD),
+            mppi_samples=int(POMDP_MPPI_SAMPLES),
+            mppi_lambda=float(POMDP_MPPI_LAMBDA),
+            mppi_sigma=float(POMDP_MPPI_SIGMA),
+        ),
+        rng=rng,
+    )
 
     def sequence_cost(u_seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next):
         th = theta; dth = dtheta
@@ -779,6 +806,9 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
                 + w_vel*(dth - dth_ref_next)**2
                 + w_u*(u*u)
             )
+            sat_excess = max(0.0, abs(u) - sat_alpha * tau_sat)
+            csum += w * (w_sat * (sat_excess**2))
+            csum += w * (w_rail * (1.0 if abs(u) > rail_beta * tau_sat else 0.0))
 
             # Gentle discounted saturation awareness during rollout
             r_step = 1.0 if abs(u) > tau_max else 0.0
@@ -787,52 +817,18 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
         return csum
 
     def cem_optimize(theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next):
-        mean = np.zeros(H, dtype=float)
-        std = np.full(H, float(POMDP_CEM_INIT_STD), dtype=float)
-        n_samples = int(POMDP_CEM_SAMPLES)
-        n_elites = int(POMDP_CEM_ELITES)
-        n_iters = int(POMDP_CEM_ITERS)
-        best_u0 = 0.0
-        best_c = np.inf
+        def cost_fn(u_seq):
+            return sequence_cost(u_seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
 
-        for _ in range(n_iters):
-            noise = rng.standard_normal((n_samples, H))
-            samples = mean[None, :] + std[None, :] * noise
-            samples = np.clip(samples, -tau_sat, tau_sat)
-            costs = np.array([
-                sequence_cost(seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
-                for seq in samples
-            ])
-            elite_idx = np.argsort(costs)[:n_elites]
-            elites = samples[elite_idx]
-            mean = elites.mean(axis=0)
-            std = elites.std(axis=0) + 1e-6
-            if costs[elite_idx[0]] < best_c:
-                best_c = float(costs[elite_idx[0]])
-                best_u0 = float(elites[0, 0])
-
+        best_u0, _ = optimizer.cem_optimize(cost_fn, last_u_ref)
         return best_u0
 
     def mppi_optimize(theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next):
-        n_samples = int(POMDP_MPPI_SAMPLES)
-        lam = float(POMDP_MPPI_LAMBDA)
-        sigma = float(POMDP_MPPI_SIGMA)
-        u_nom = np.zeros(H, dtype=float)
+        def cost_fn(u_seq):
+            return sequence_cost(u_seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
 
-        noise = rng.standard_normal((n_samples, H)) * sigma
-        samples = u_nom[None, :] + noise
-        samples = np.clip(samples, -tau_sat, tau_sat)
-        costs = np.array([
-            sequence_cost(seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
-            for seq in samples
-        ])
-        c_min = float(costs.min())
-        weights = np.exp(-(costs - c_min) / max(lam, 1e-6))
-        weights_sum = weights.sum()
-        if weights_sum > 0.0:
-            u_nom += (weights[:, None] * noise).sum(axis=0) / weights_sum
-        u_nom = np.clip(u_nom, -tau_sat, tau_sat)
-        return float(u_nom[0])
+        u0, _ = optimizer.mppi_optimize(cost_fn, last_u_ref)
+        return u0
 
     def inner(k, theta, dtheta, belief, last_u_ref):
         k  = int(k)
@@ -879,6 +875,9 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
                     + w_vel*(dth - dth_ref_next)**2
                     + w_u*(u*u)
                 )
+                sat_excess = max(0.0, abs(u) - sat_alpha * tau_sat)
+                csum += w * (w_sat * (sat_excess**2))
+                csum += w * (w_rail * (1.0 if abs(u) > rail_beta * tau_sat else 0.0))
 
                 # Gentle discounted saturation awareness during rollout
                 r_step = 1.0 if abs(u) > tau_max else 0.0
@@ -928,7 +927,9 @@ class HingePOMDP:
             J_est=self.J_est, D_est=self.D_est,
             w_track=POMDP_W_TRACK, w_vel=POMDP_W_VEL,
             w_u=POMDP_W_U, w_risk=POMDP_W_RISK,
-            w_du=POMDP_W_DU
+            w_du=POMDP_W_DU, w_sat=POMDP_W_SAT, w_rail=POMDP_W_RAIL,
+            sat_alpha=POMDP_SAT_ALPHA, rail_beta=POMDP_RAIL_BETA,
+            du_max=POMDP_DU_MAX
         )
 
         self.sp      = 0.0
@@ -938,6 +939,14 @@ class HingePOMDP:
         self._a_hat  = None
         self.last_tau_cmd = 0.0
         self.last_risk    = 0.0
+        self.last_costs = {
+            "track": 0.0,
+            "vel": 0.0,
+            "u": 0.0,
+            "du": 0.0,
+            "sat": 0.0,
+            "rail": 0.0,
+        }
 
         # (7) integral bias to kill steady‑state error
         self.bias_u = 0.0
@@ -990,6 +999,7 @@ class HingePOMDP:
         self.bias_u = clamp(self.bias_u, -self.bias_limit, self.bias_limit)
 
         # choose torque using Δu penalty and add bias
+        prev_u = self.last_tau_cmd
         u_raw = float(self.ctrl_fun(self.k, q, dq, self.belief, self.last_tau_cmd)) + self.bias_u
         # keep optional smoothing path but alpha=0 by default
         u = (1.0 - POMDP_U_SMOOTH_ALPHA) * u_raw + POMDP_U_SMOOTH_ALPHA * self.last_tau_cmd
@@ -1025,6 +1035,17 @@ class HingePOMDP:
 
         # (3) risk = actuator saturation probability surrogate
         self.last_risk = float(1.0 if abs(u) > TAU_MAX_FOR_RISK else 0.0)
+
+        dth_ref = (self.theta_ref[-1] - self.theta_ref[-2]) / dt if len(self.theta_ref) > 1 else 0.0
+        sat_excess = max(0.0, abs(u) - POMDP_SAT_ALPHA * self.tau_sat)
+        self.last_costs = {
+            "track": POMDP_W_TRACK * (q - self.sp)**2,
+            "vel": POMDP_W_VEL * (dq - dth_ref)**2,
+            "u": POMDP_W_U * (u * u),
+            "du": POMDP_W_DU * (u - prev_u)**2,
+            "sat": POMDP_W_SAT * (sat_excess**2),
+            "rail": POMDP_W_RAIL * (1.0 if abs(u) > POMDP_RAIL_BETA * self.tau_sat else 0.0),
+        }
 
         self.k += 1
 
@@ -1201,10 +1222,19 @@ class GraspSM:
         pos_err = self.v_contact.last_pos_err if self.v_contact.enabled else 0.0
         rot_err = self.v_contact.last_rot_err if self.v_contact.enabled else 0.0
         risk    = self.hinge.last_risk if self.hinge.enabled else 0.0
+        costs   = self.hinge.last_costs if self.hinge.enabled else {}
 
         pkt = dict(t=t, angle=angle, setpoint=setpoint,
                    tau_cmd=tau_cmd, tau_load=tau_load,
                    F=F, M=M, pos_err=pos_err, rot_err=rot_err, risk=risk)
+        pkt.update({
+            "c_track": costs.get("track", 0.0),
+            "c_vel": costs.get("vel", 0.0),
+            "c_u": costs.get("u", 0.0),
+            "c_du": costs.get("du", 0.0),
+            "c_sat": costs.get("sat", 0.0),
+            "c_rail": costs.get("rail", 0.0),
+        })
         try:
             self.plot_q.put_nowait(pkt)
         except queue.Full:
@@ -1261,6 +1291,12 @@ class TelemetryRecorder:
                 "pos_err": pkt["pos_err"],
                 "rot_err": pkt["rot_err"],
                 "risk": pkt["risk"],
+                "c_track": pkt["c_track"],
+                "c_vel": pkt["c_vel"],
+                "c_u": pkt["c_u"],
+                "c_du": pkt["c_du"],
+                "c_sat": pkt["c_sat"],
+                "c_rail": pkt["c_rail"],
             })
 
     def flush(self):
@@ -1280,6 +1316,29 @@ class TelemetryRecorder:
             arr = {k: np.array([r[k] for r in self.rows], float) for k in self.rows[0].keys()}
             np.savez(path, **arr)
             print(f"[log] NPZ written: {path}")
+        arr = {k: np.array([r[k] for r in self.rows], float) for k in self.rows[0].keys()}
+        abs_u = np.abs(arr["tau_cmd"])
+        mean_abs_u = float(abs_u.mean()) if abs_u.size else 0.0
+        max_abs_u = float(abs_u.max()) if abs_u.size else 0.0
+        frac_08 = float((abs_u > (0.8 * POMDP_TAU_SAT)).mean()) if abs_u.size else 0.0
+        frac_095 = float((abs_u > (0.95 * POMDP_TAU_SAT)).mean()) if abs_u.size else 0.0
+        cost_totals = {
+            "track": float(arr["c_track"].sum()),
+            "vel": float(arr["c_vel"].sum()),
+            "u": float(arr["c_u"].sum()),
+            "du": float(arr["c_du"].sum()),
+            "sat": float(arr["c_sat"].sum()),
+            "rail": float(arr["c_rail"].sum()),
+        }
+        print(
+            "[log] Torque stats: mean|u|={:.3f}, max|u|={:.3f}, frac>|0.8|={:.3f}, frac>|0.95|={:.3f}".format(
+                mean_abs_u, max_abs_u, frac_08, frac_095
+            )
+        )
+        print(
+            "[log] Cost breakdown: track={track:.3f}, vel={vel:.3f}, u={u:.3f}, du={du:.3f}, "
+            "sat={sat:.3f}, rail={rail:.3f}".format(**cost_totals)
+        )
         self.rows.clear()
 
 
