@@ -130,6 +130,16 @@ POMDP_W_ERR_SOFT      = 0.02
 N_ACTIONS = 257
 _z = np.linspace(-1.0, 1.0, N_ACTIONS)
 ACTIONS  = POMDP_TAU_SAT * np.sign(_z) * (np.abs(_z)**1.7)
+POMDP_CTRL_MODE     = "cem"  # "discrete", "cem", or "mppi"
+
+# Continuous action optimization (CEM / MPPI)
+POMDP_CEM_SAMPLES   = 192
+POMDP_CEM_ELITES    = 24
+POMDP_CEM_ITERS     = 4
+POMDP_CEM_INIT_STD  = 0.6 * POMDP_TAU_SAT
+POMDP_MPPI_SAMPLES  = 256
+POMDP_MPPI_LAMBDA   = 6.0
+POMDP_MPPI_SIGMA    = 0.5 * POMDP_TAU_SAT
 
 # POMDP model / weights
 POMDP_J_EST        = 0.08   # runtime value computed from MuJoCo (2)
@@ -748,6 +758,100 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
     J_est = float(J_est); D_est = float(D_est)
     H = int(POMDP_H_CTRL)
     gamma = float(POMDP_GAMMA)
+    tau_sat = float(np.max(np.abs(action_levels)))
+    rng = np.random.default_rng()
+
+    def sequence_cost(u_seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next):
+        th = theta; dth = dtheta
+        csum = 0.0
+
+        # Δu penalty
+        u0 = float(u_seq[0])
+        csum += w_du * (u0 - last_u_ref)**2
+
+        # Immediate risks
+        r_act_now = 1.0 if abs(u0) > tau_max else 0.0
+        e_now_abs = abs(theta - th_ref_next)
+        r_err_now = 1.0 if e_now_abs > err_risk_thresh else 0.0
+        csum += w_risk_act * r_act_now + w_risk_err * r_err_now
+        if r_act_now > (p_max - 0.05):
+            csum += 10.0 * (r_act_now - (p_max - 0.05))
+
+        # Horizon rollout
+        for h in range(H):
+            u = float(u_seq[h])
+            tau_f_bel = 0.0
+            for j in range(N_REG):
+                tau_f_bel += belief[j] * friction_torque(th, dth, j, params)
+
+            ddth = (u - tau_f_bel - D_est*dth) / J_est
+            dth  = dth + dt*ddth
+            th   = th  + dt*dth
+
+            w = (gamma**h)
+            e_h_abs = abs(th - th_ref_next)
+
+            csum += w * (w_track*(th - th_ref_next)**2
+                         + w_vel*(dth - dth_ref_next)**2
+                         + w_u*(u*u))
+            # small L1 error cost
+            csum += w * (w_err_soft * e_h_abs)
+
+            # gentle discounted risks along horizon
+            r_act_step = 1.0 if abs(u) > tau_max else 0.0
+            r_err_step = 1.0 if e_h_abs > err_risk_thresh else 0.0
+            csum += w * (0.2 * w_risk_act) * r_act_step
+            csum += w * (0.2 * w_risk_err) * r_err_step
+
+        return csum
+
+    def cem_optimize(theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next):
+        mean = np.zeros(H, dtype=float)
+        std = np.full(H, float(POMDP_CEM_INIT_STD), dtype=float)
+        n_samples = int(POMDP_CEM_SAMPLES)
+        n_elites = int(POMDP_CEM_ELITES)
+        n_iters = int(POMDP_CEM_ITERS)
+        best_u0 = 0.0
+        best_c = np.inf
+
+        for _ in range(n_iters):
+            noise = rng.standard_normal((n_samples, H))
+            samples = mean[None, :] + std[None, :] * noise
+            samples = np.clip(samples, -tau_sat, tau_sat)
+            costs = np.array([
+                sequence_cost(seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
+                for seq in samples
+            ])
+            elite_idx = np.argsort(costs)[:n_elites]
+            elites = samples[elite_idx]
+            mean = elites.mean(axis=0)
+            std = elites.std(axis=0) + 1e-6
+            if costs[elite_idx[0]] < best_c:
+                best_c = float(costs[elite_idx[0]])
+                best_u0 = float(elites[0, 0])
+
+        return best_u0
+
+    def mppi_optimize(theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next):
+        n_samples = int(POMDP_MPPI_SAMPLES)
+        lam = float(POMDP_MPPI_LAMBDA)
+        sigma = float(POMDP_MPPI_SIGMA)
+        u_nom = np.zeros(H, dtype=float)
+
+        noise = rng.standard_normal((n_samples, H)) * sigma
+        samples = u_nom[None, :] + noise
+        samples = np.clip(samples, -tau_sat, tau_sat)
+        costs = np.array([
+            sequence_cost(seq, theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
+            for seq in samples
+        ])
+        c_min = float(costs.min())
+        weights = np.exp(-(costs - c_min) / max(lam, 1e-6))
+        weights_sum = weights.sum()
+        if weights_sum > 0.0:
+            u_nom += (weights[:, None] * noise).sum(axis=0) / weights_sum
+        u_nom = np.clip(u_nom, -tau_sat, tau_sat)
+        return float(u_nom[0])
 
     def inner(k, theta, dtheta, belief, last_u_ref):
         k  = int(k)
@@ -757,6 +861,11 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
         # Hold the nearest future setpoint constant over the short horizon
         th_ref_next  = float(theta_ref[k1])
         dth_ref_next = (theta_ref[k1] - theta_ref[k0]) / dt
+
+        if POMDP_CTRL_MODE == "mppi":
+            return mppi_optimize(theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
+        if POMDP_CTRL_MODE == "cem":
+            return cem_optimize(theta, dtheta, belief, last_u_ref, th_ref_next, dth_ref_next)
 
         best_u = 0.0; best_c = np.inf
 
