@@ -105,6 +105,22 @@ PLOT_WINDOW_SEC     = 30.0   # dynamic autoscale over whole trajectory anyway
 # --- POMDP hinge config -------------------------------------------------------
 POMDP_TAU_SAT            = 5.0                 # torque cap (N·m)
 POMDP_SP_SPEED_RAD_S     = math.radians(12.0)  # setpoint slew
+POMDP_USE_DISCRETE_REGIMES = False
+
+# Continuous-parameter estimator controls (EKF): init covariance, process noise,
+# and parameter bounds clamp the estimate to plausible ranges for stability.
+POMDP_PARAM_INIT = np.array([0.35 * POMDP_TAU_SAT,
+                             0.60 * POMDP_TAU_SAT,
+                             18.0,
+                             0.05 * POMDP_TAU_SAT], dtype=float)
+POMDP_PARAM_INIT_COV = np.diag([0.4, 0.6, 36.0, 0.15]) ** 2
+POMDP_PARAM_PROCESS_NOISE = np.diag([0.02, 0.03, 0.6, 0.01]) ** 2
+POMDP_PARAM_BOUNDS = np.array([
+    [0.05 * POMDP_TAU_SAT, 1.00 * POMDP_TAU_SAT],  # Fc
+    [0.10 * POMDP_TAU_SAT, 1.20 * POMDP_TAU_SAT],  # Fs
+    [2.0, 45.0],                                   # slope
+    [-0.35 * POMDP_TAU_SAT, 0.35 * POMDP_TAU_SAT], # hyst_bias
+], dtype=float)
 
 @dataclass
 class StribeckParameters:
@@ -158,6 +174,12 @@ LOAD_PHASE          = 0.0
 
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
+
+def clamp_params(params: np.ndarray, bounds: np.ndarray) -> np.ndarray:
+    params = np.asarray(params, float).copy()
+    for i, (lo, hi) in enumerate(bounds):
+        params[i] = clamp(params[i], lo, hi)
+    return params
 
 def id_or_fail(model, objtype, name):
     i = mj.mj_name2id(model, objtype, name)
@@ -674,8 +696,16 @@ class WorldPoseHold:
 REG_NAMES = ["threshold", "saw", "hysteresis", "sinusoid", "sliding"]
 N_REG = len(REG_NAMES)
 
-def friction_torque(theta: float, dtheta: float, reg: int, p: StribeckParameters) -> float:
-    """Regime‑dependent frictional torque."""
+def friction_torque(theta: float, dtheta: float, params: np.ndarray) -> float:
+    """Continuous-parameter Stribeck + hysteresis friction model."""
+    Fc, Fs, slope, hyst_bias = params
+    slope = max(float(slope), 1e-3)
+    vmag = abs(dtheta)
+    stribeck = Fc + (Fs - Fc) * math.exp(-vmag * slope)
+    return stribeck * math.tanh(slope * dtheta) + hyst_bias * np.sign(theta)
+
+def friction_torque_regime(theta: float, dtheta: float, reg: int, p: StribeckParameters) -> float:
+    """Regime‑dependent frictional torque (discrete A/B path)."""
     if reg == 0:  # threshold (static near zero velocity)
         return p.Fs * np.sign(dtheta) * (abs(dtheta) < 0.02)
     if reg == 1:  # saw‑tooth in angle (asymmetric)
@@ -736,7 +766,8 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
                     w_du: float,
                     w_err_soft: float,
                     err_risk_thresh: float,
-                    w_risk_err: float):
+                    w_risk_err: float,
+                    use_discrete_regimes: bool):
     """
     Discrete action selection with a short horizon rollout.
     Includes:
@@ -749,7 +780,7 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
     H = int(POMDP_H_CTRL)
     gamma = float(POMDP_GAMMA)
 
-    def inner(k, theta, dtheta, belief, last_u_ref):
+    def inner(k, theta, dtheta, belief_or_params, last_u_ref):
         k  = int(k)
         k1 = min(k + 1, len(theta_ref)-1)
         k0 = min(k,     len(theta_ref)-1)
@@ -777,11 +808,14 @@ def pomdp_only_ctrl(action_levels: np.ndarray,
 
             # Horizon rollout
             for h in range(H):
-                tau_f_bel = 0.0
-                for j in range(N_REG):
-                    tau_f_bel += belief[j] * friction_torque(th, dth, j, params)
+                if use_discrete_regimes:
+                    tau_f = 0.0
+                    for j in range(N_REG):
+                        tau_f += belief_or_params[j] * friction_torque_regime(th, dth, j, params)
+                else:
+                    tau_f = friction_torque(th, dth, belief_or_params)
 
-                ddth = (u - tau_f_bel - D_est*dth) / J_est
+                ddth = (u - tau_f - D_est*dth) / J_est
                 dth  = dth + dt*ddth
                 th   = th  + dt*dth
 
@@ -829,6 +863,7 @@ class HingePOMDP:
         self.tau_sat = float(tau_sat)
         self.sp_speed = float(sp_speed)
         self.params = params
+        self.use_discrete_regimes = bool(POMDP_USE_DISCRETE_REGIMES)
 
         self.J_est = float(J_est)
         self.D_est = float(D_est)
@@ -836,6 +871,9 @@ class HingePOMDP:
         self.theta_ref: List[float] = []
         self.k = 0
         self.belief = np.ones(N_REG, float) / N_REG
+        self.param_x = clamp_params(POMDP_PARAM_INIT, POMDP_PARAM_BOUNDS)
+        self.param_P = np.array(POMDP_PARAM_INIT_COV, float)
+        self.param_log: List[Tuple[int, np.ndarray]] = []
         self.ctrl_fun = pomdp_only_ctrl(
             ACTIONS, self.params, self.theta_ref, self.dt,
             p_max=P_MAX_RISK, tau_max=TAU_MAX_FOR_RISK,
@@ -844,7 +882,8 @@ class HingePOMDP:
             w_u=POMDP_W_U, w_risk_act=POMDP_W_RISK,
             w_du=POMDP_W_DU, w_err_soft=POMDP_W_ERR_SOFT,
             err_risk_thresh=ERROR_RISK_THRESH_RAD,
-            w_risk_err=POMDP_W_RISK_ERR
+            w_risk_err=POMDP_W_RISK_ERR,
+            use_discrete_regimes=self.use_discrete_regimes,
         )
 
         self.sp      = 0.0
@@ -858,6 +897,8 @@ class HingePOMDP:
         self.last_risk_act = 0.0
         self.last_risk_err = 0.0
         self.last_risk     = 0.0
+        self.param_Q = np.array(POMDP_PARAM_PROCESS_NOISE, float)
+        self.param_bounds = np.array(POMDP_PARAM_BOUNDS, float)
 
         # (7) integral bias to kill steady‑state error
         self.bias_u = 0.0
@@ -870,7 +911,12 @@ class HingePOMDP:
         self.theta_ref[:] = [q, q]
         self.prev_v = float(self.data.qvel[self.vadr])
         self._a_hat = 0.0
-        self.belief[:] = 1.0/N_REG
+        if self.use_discrete_regimes:
+            self.belief[:] = 1.0/N_REG
+        else:
+            self.param_x = clamp_params(POMDP_PARAM_INIT, self.param_bounds)
+            self.param_P = np.array(POMDP_PARAM_INIT_COV, float)
+            self.param_log.clear()
         self.k = 0
         self.enabled = True
         print(f"[hinge-POMDP] Enabled at q={q:.4f} rad; tau_sat={self.tau_sat:.1f} N·m; J_est={self.J_est:.4f}")
@@ -910,7 +956,8 @@ class HingePOMDP:
         self.bias_u = clamp(self.bias_u, -self.bias_limit, self.bias_limit)
 
         # choose torque using Δu penalty and add bias
-        u_raw = float(self.ctrl_fun(self.k, q, dq, self.belief, self.last_tau_cmd)) + self.bias_u
+        ctrl_state = self.belief if self.use_discrete_regimes else self.param_x
+        u_raw = float(self.ctrl_fun(self.k, q, dq, ctrl_state, self.last_tau_cmd)) + self.bias_u
         # keep optional smoothing path but alpha=0 by default
         u = (1.0 - POMDP_U_SMOOTH_ALPHA) * u_raw + POMDP_U_SMOOTH_ALPHA * self.last_tau_cmd
         u = clamp(u, -self.tau_sat, self.tau_sat)
@@ -928,20 +975,43 @@ class HingePOMDP:
 
         tau_dyn = self.J_est * a_meas + self.D_est * dq
 
-        e = np.empty(N_REG)
-        for j in range(N_REG):
-            tau_f_j = friction_torque(q, dq, j, self.params)
-            e[j] = (u - tau_dyn) - (tau_f_j)  # (no external FF per request)
+        if self.use_discrete_regimes:
+            e = np.empty(N_REG)
+            for j in range(N_REG):
+                tau_f_j = friction_torque_regime(q, dq, j, self.params)
+                e[j] = (u - tau_dyn) - (tau_f_j)  # (no external FF per request)
 
-        L = np.exp(-0.5 * (e / SIGMA_RESIDUAL)**2)
-        L = np.clip(L, 1e-12, None)
+            L = np.exp(-0.5 * (e / SIGMA_RESIDUAL)**2)
+            L = np.clip(L, 1e-12, None)
 
-        T = transition_matrix(u, dq, q, self.params)
-        b_pred = self.belief @ T
-        b_post = b_pred * L
-        b_post = np.clip(b_post, BELIEF_FLOOR, None)
-        b_post /= b_post.sum()
-        self.belief = b_post
+            T = transition_matrix(u, dq, q, self.params)
+            b_pred = self.belief @ T
+            b_post = b_pred * L
+            b_post = np.clip(b_post, BELIEF_FLOOR, None)
+            b_post /= b_post.sum()
+            self.belief = b_post
+        else:
+            y = (u - tau_dyn)
+            tau_f = friction_torque(q, dq, self.param_x)
+            resid = y - tau_f
+
+            self.param_P = self.param_P + self.param_Q
+            H = np.zeros((1, self.param_x.size))
+            for i in range(self.param_x.size):
+                delta = 1e-4 * max(1.0, abs(self.param_x[i]))
+                dp = np.zeros_like(self.param_x)
+                dp[i] = delta
+                tau_plus = friction_torque(q, dq, self.param_x + dp)
+                tau_minus = friction_torque(q, dq, self.param_x - dp)
+                H[0, i] = (tau_plus - tau_minus) / (2.0 * delta)
+
+            S = H @ self.param_P @ H.T + SIGMA_RESIDUAL**2
+            S_scalar = float(S.squeeze())
+            K = (self.param_P @ H.T) / S_scalar
+            self.param_x = self.param_x + (K.flatten() * resid)
+            self.param_P = (np.eye(self.param_x.size) - K @ H) @ self.param_P
+            self.param_x = clamp_params(self.param_x, self.param_bounds)
+            self.param_log.append((self.k, self.param_x.copy()))
 
         # risks (current surrogates for UI/logging)
         self.last_risk_act = float(1.0 if abs(u) > TAU_MAX_FOR_RISK else 0.0)
@@ -1128,11 +1198,14 @@ class GraspSM:
         tau_load = float(self.hload.last_tau) if self.hload.enabled else 0.0
         bias_u   = float(self.hinge.bias_u) if hinge_en else 0.0
 
-        # expected friction torque (belief-weighted)
+        # expected friction torque (belief-weighted or continuous params)
         tau_f_exp = 0.0
         if hinge_en:
-            for j in range(N_REG):
-                tau_f_exp += self.hinge.belief[j] * friction_torque(angle, dq, j, self.hinge.params)
+            if self.hinge.use_discrete_regimes:
+                for j in range(N_REG):
+                    tau_f_exp += self.hinge.belief[j] * friction_torque_regime(angle, dq, j, self.hinge.params)
+            else:
+                tau_f_exp = friction_torque(angle, dq, self.hinge.param_x)
         tau_f_exp = float(tau_f_exp)
 
         # contact info
@@ -1146,8 +1219,9 @@ class GraspSM:
         risk_err = float(self.hinge.last_risk_err) if hinge_en else 0.0
         risk     = max(risk_act, risk_err)
 
-        # belief (flatten)
-        b = list(self.hinge.belief) if hinge_en else [0.0]*N_REG
+        # belief/params (flatten)
+        b = list(self.hinge.belief) if hinge_en and self.hinge.use_discrete_regimes else [0.0]*N_REG
+        param_x = list(self.hinge.param_x) if hinge_en and not self.hinge.use_discrete_regimes else [0.0]*4
 
         pkt = dict(
             t=t,
@@ -1158,6 +1232,7 @@ class GraspSM:
             risk_act=risk_act, risk_err=risk_err, risk=risk,
             J_est=float(self.hinge.J_est), D_est=float(self.hinge.D_est),
             b=b,
+            param_x=param_x,
         )
         try:
             self.plot_q.put_nowait(pkt)
@@ -1221,6 +1296,11 @@ class TelemetryRecorder:
         for i in range(len(b)):
             r[f"b{i}"] = float(b[i])
 
+        # Continuous parameter estimate
+        param_x = list(pkt.get("param_x", []))
+        for i in range(len(param_x)):
+            r[f"p{i}"] = float(param_x[i])
+
         return r
 
     def add(self, pkt: Dict[str, float]):
@@ -1240,6 +1320,10 @@ class TelemetryRecorder:
         # Guarantee belief columns exist for N_REG regimes
         for i in range(N_REG):
             col = f"b{i}"
+            if col not in cols:
+                cols.append(col)
+        for i in range(4):
+            col = f"p{i}"
             if col not in cols:
                 cols.append(col)
         try:
